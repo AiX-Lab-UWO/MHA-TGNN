@@ -50,7 +50,6 @@ project_root/
 └── deblur_landmarks.py # This main script
 
 
----
 
 ## ⚙️ Script Configuration
 
@@ -66,3 +65,12 @@ REPO_ROOT = r'...\MB-TaylorFormerV2-main\MB-TaylorFormerV2-main'
 YAML_PATH = r'...\MB-TaylorFormerV2-main\MB-TaylorFormerV2-main\Deblurring\Options\MB-TaylorFormerV2-XL.yml'
 WEIGHTS_PATH = r'...\MB-TaylorFormerV2-main\MB-TaylorFormerV2-main\Deblurring\gopro-XL.pth'
 
+🧩 Dependencies
+
+Create or activate your Python environment (e.g., conda activate Cudatest)
+and install the following packages:
+
+```
+pip install torch torchvision torchaudio
+pip install opencv-python mediapipe pyyaml numpy
+```
