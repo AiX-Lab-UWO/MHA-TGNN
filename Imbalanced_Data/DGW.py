@@ -1,5 +1,5 @@
 # ============================================================
-# DGW — Fixed-Topology + Edge Attributes + CB-Focal (no sampler)
+# DGW — Fixed-Topology + Edge Attributes + CB-Focal
 # ============================================================
 
 import os
