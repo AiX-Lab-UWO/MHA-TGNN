@@ -14,8 +14,8 @@ import mediapipe as mp
 # EDIT THESE PATHS IF NEEDED
 # =========================
 # Your DGW image folders
-VAL_DIR   = r'D:\DGW\DGW_Dataset\cleaned_data\val_cleaned\val'
-TRAIN_DIR = r'D:\DGW\DGW_Dataset\train\train'
+VAL_DIR   = r'...\DGW_Dataset\cleaned_data\val'
+TRAIN_DIR = r'...\DGW_Dataset\train'
 
 # Output CSVs/logs
 OUT_BASE = r'...\DGW_Dataset\Deblurred'
