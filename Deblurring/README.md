@@ -64,6 +64,7 @@ OUT_BASE  = r'...\DGW_Dataset\Deblurred'
 REPO_ROOT = r'...\MB-TaylorFormerV2-main\MB-TaylorFormerV2-main'
 YAML_PATH = r'...\MB-TaylorFormerV2-main\MB-TaylorFormerV2-main\Deblurring\Options\MB-TaylorFormerV2-XL.yml'
 WEIGHTS_PATH = r'...\MB-TaylorFormerV2-main\MB-TaylorFormerV2-main\Deblurring\gopro-XL.pth'
+```
 
 🧩 Dependencies
 
