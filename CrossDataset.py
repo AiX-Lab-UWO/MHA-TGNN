@@ -42,6 +42,11 @@ EDGE_ATTR_DIM  = 4   # [ux, uy, uz, log1p(dist)]
 SYMMETRIC_EDGES = False  # keep the directed prior as in your baseline
 NUM_SUBJECTS   = 15
 
+# CB-Focal (imbalance)
+CB_BETA          = 0.995    # 0.99–0.999 usually
+FOCAL_GAMMA      = 1.5      # 1.0–2.0
+LABEL_SMOOTHING  = 0.05
+
 # ========= Unified 7-class mapping (your rules) =========
 # We convert both datasets to a shared label space {0..6}:
 # U0 := DMD zone 3                <-> DGW zones {1,2} merged
@@ -84,6 +89,51 @@ def map_dmd_to_unified(z_dmd: int) -> int:
     raise ValueError(f"DMD label not recognized: {z}")
 
 NUM_CLASSES = 7  # unified
+
+# ---- CB-Focal criterion (add this) ------------------------------------------
+def make_cb_focal_criterion(class_counts, num_classes, beta=0.995, gamma=1.5, label_smoothing=0.05, eps=1e-8, device=None):
+    """
+    Class-Balanced Focal Loss with label smoothing.
+    - class_counts: array-like of length C with sample counts per class
+    """
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    # Class-Balanced weights (Effective Number of Samples)
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # normalize weights to mean 1.0 (keeps loss scale stable)
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B] (long)
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)          # [B, C]
+
+        # label smoothing: y = (1-ε)*one_hot + ε/C
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        # focal modulating factor using p_t = sum_c y_true_c * p_c
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)             # [B]
+        focal = (1.0 - p_t).pow(gamma)                               # [B]
+
+        # per-class alpha weighting applied per column
+        alpha = weights.to(logits.device)                            # [C]
+        # CE with smoothing (no .gather), weighted per class
+        ce_per_class = -y_true * torch.log(probs) * alpha            # [B, C]
+        ce = ce_per_class.sum(dim=1)                                 # [B]
+
+        loss = (focal * ce).mean()
+        return loss
+
+    return criterion
 
 # -----------------------------
 # Model
@@ -300,12 +350,18 @@ if __name__ == "__main__":
 
     modelA = make_model()
     optA, schA = make_opt_sched(modelA)
-    crit = nn.CrossEntropyLoss()
+
+    # ---- CB-Focal criterion for phase A (DMD counts) -------------------------
+    counts_A = np.bincount([int(d.y.item()) for d in all_dmd_graphs], minlength=NUM_CLASSES)
+    critA = make_cb_focal_criterion(counts_A, NUM_CLASSES,
+                                    beta=CB_BETA, gamma=FOCAL_GAMMA,
+                                    label_smoothing=LABEL_SMOOTHING,
+                                    device=DEVICE)
 
     if DEVICE.type == "cuda": torch.cuda.synchronize()
     t0 = time.perf_counter()
     for ep in range(1, EPOCHS + 1):
-        loss = train_one_epoch(modelA, train_loader_dmd, optA, crit, DEVICE)
+        loss = train_one_epoch(modelA, train_loader_dmd, optA, critA, DEVICE)
         schA.step()
         print(f"[A][epoch {ep:03d}] loss={loss:.4f}")
     if DEVICE.type == "cuda": torch.cuda.synchronize()
@@ -330,10 +386,17 @@ if __name__ == "__main__":
     modelB = make_model()
     optB, schB = make_opt_sched(modelB)
 
+    # ---- CB-Focal criterion for phase B (DGW counts) -------------------------
+    counts_B = np.bincount([int(d.y.item()) for d in dgw_train_graphs], minlength=NUM_CLASSES)
+    critB = make_cb_focal_criterion(counts_B, NUM_CLASSES,
+                                    beta=CB_BETA, gamma=FOCAL_GAMMA,
+                                    label_smoothing=LABEL_SMOOTHING,
+                                    device=DEVICE)
+
     if DEVICE.type == "cuda": torch.cuda.synchronize()
     t0 = time.perf_counter()
     for ep in range(1, EPOCHS + 1):
-        loss = train_one_epoch(modelB, train_loader_dgw, optB, crit, DEVICE)
+        loss = train_one_epoch(modelB, train_loader_dgw, optB, critB, DEVICE)
         schB.step()
         print(f"[B][epoch {ep:03d}] loss={loss:.4f}")
     if DEVICE.type == "cuda": torch.cuda.synchronize()
