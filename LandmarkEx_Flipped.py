@@ -1,19 +1,3 @@
-"""
-DGW -> (Flip horizontally) -> MediaPipe FaceMesh (478 landmarks) -> CSVs
-
-Input folders (class subfolders named 1..9):
-    VAL:   ...\DGW_Dataset\val
-    TRAIN: ...\DGW_Dataset\train
-
-Outputs:
-    Flipped images under:
-        ...\DGW\DGW_Dataset\flipped\val\1..9\*.png
-       ...\DGW\DGW_Dataset\flipped\train\1..9\*.png
-    Landmark CSVs:
-        ...\DGW\DGW_Dataset\cleaned_data\val_cleaned_landmarks.csv
-        ...\DGW\DGW_Dataset\cleaned_data\train_cleaned_landmarks.csv
-"""
-
 import os
 import sys
 import csv
