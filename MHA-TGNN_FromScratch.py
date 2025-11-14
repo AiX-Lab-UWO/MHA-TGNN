@@ -1,4 +1,3 @@
-
 import os
 import torch
 from torch_geometric.data import DataLoader, Data
@@ -15,6 +14,59 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
+
+CB_BETA         = 0.995     # 0.99–0.999 usually
+FOCAL_GAMMA     = 1.5       # 1.0–2.0
+LABEL_SMOOTHING = 0.05      # 0–0.1 typically
+NUM_CLASSES     = 9
+EPS             = 1e-8
+
+def make_cb_focal_criterion(class_counts,
+                            num_classes,
+                            beta=0.995,
+                            gamma=1.5,
+                            label_smoothing=0.05,
+                            eps=1e-8,
+                            device=None):
+
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    # Class-Balanced weights (Effective Number of Samples)
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # normalize weights to mean 1.0 (keeps loss scale stable)
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B]
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)  # [B, C]
+
+        # label smoothing: y = (1-ε)*one_hot + ε/C
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        # p_t = sum_c y_true_c * p_c
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)     # [B]
+        focal = (1.0 - p_t).pow(gamma)                      # [B]
+
+        # per-class alpha weighting
+        alpha = weights.to(logits.device)                   # [C]
+        ce_per_class = -y_true * torch.log(probs) * alpha   # [B, C]
+        ce = ce_per_class.sum(dim=1)                        # [B]
+
+        loss = (focal * ce).mean()
+        return loss
+
+    return criterion
+
 
 # TransformerNet model definition
 class TransformerNet(torch.nn.Module):
@@ -70,7 +122,7 @@ def evaluate_and_print_results(model, test_loader, device, test_type):
     print(f"Accuracy: {accuracy:.4f}")
     print("Confusion Matrix:")
     print(cm)
-    ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(range(9))).plot(cmap="viridis")
+    ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(range(NUM_CLASSES))).plot(cmap="viridis")
     plt.title(f"Confusion Matrix ({test_type})")
     plt.show()
 
@@ -102,7 +154,7 @@ def evaluate(model, loader, device):
             labels.extend(data.y.cpu().numpy())
             predictions.extend(preds)
     accuracy = accuracy_score(labels, predictions)
-    cm = confusion_matrix(labels, predictions, labels=list(range(9)))
+    cm = confusion_matrix(labels, predictions, labels=list(range(NUM_CLASSES)))
     return accuracy, cm
 
 
@@ -114,12 +166,17 @@ if __name__ == "__main__":
     # Edges for the graph
     edges = [(468, node) for node in range(478) if node != 468]
     edges += [(473, node) for node in range(478) if node != 473]
-    edges.extend([(471, 159), (159, 469), (469, 145), (145, 471), (476, 475), (475, 474), (474, 477), (477, 476),
-                  (1, 33), (1, 173), (1, 162), (1, 263), (1, 398), (1, 368), (33, 246), (146, 161), (161, 160),
-                  (160, 150), (150, 158), (158, 157), (157, 173), (173, 155), (155, 154), (154, 153), (153, 145),
-                  (145, 144), (144, 163), (163, 7), (7, 33), (398, 384), (384, 385), (385, 386), (386, 387), (387, 388),
-                  (388, 263), (263, 249), (249, 390), (390, 373), (373, 374), (374, 380), (380, 381), (381, 382),
-                  (382, 398)])
+    edges.extend([
+        (471, 159), (159, 469), (469, 145), (145, 471),
+        (476, 475), (475, 474), (474, 477), (477, 476),
+        (1, 33), (1, 173), (1, 162), (1, 263), (1, 398), (1, 368),
+        (33, 246), (146, 161), (161, 160), (160, 150), (150, 158), (158, 157),
+        (157, 173), (173, 155), (155, 154), (154, 153), (153, 145), (145, 144),
+        (144, 163), (163, 7), (7, 33),
+        (398, 384), (384, 385), (385, 386), (386, 387), (387, 388),
+        (388, 263), (263, 249), (249, 390), (390, 373), (373, 374),
+        (374, 380), (380, 381), (381, 382), (382, 398)
+    ])
 
     # Cross-validation setup
     num_subjects = 15
@@ -132,48 +189,81 @@ if __name__ == "__main__":
 
         for i in train_idx:
             subject_path_rgb = os.path.join(data_dir, str(i + 1), "Landmark_RGB_Valid.csv")
-            subject_path_ir = os.path.join(data_dir, str(i + 1), "Landmark_IR_Valid.csv")
+            subject_path_ir  = os.path.join(data_dir, str(i + 1), "Landmark_IR_Valid.csv")
             train_data_rgb.extend(load_data(subject_path_rgb, edges))
             train_data_ir.extend(load_data(subject_path_ir, edges))
 
         for i in test_idx:
             subject_path_rgb = os.path.join(data_dir, str(i + 1), "Landmark_RGB_Valid.csv")
-            subject_path_ir = os.path.join(data_dir, str(i + 1), "Landmark_IR_Valid.csv")
+            subject_path_ir  = os.path.join(data_dir, str(i + 1), "Landmark_IR_Valid.csv")
             test_data_rgb.extend(load_data(subject_path_rgb, edges))
             test_data_ir.extend(load_data(subject_path_ir, edges))
 
         # Data loaders
         train_loader_rgb = DataLoader(train_data_rgb, batch_size=32, shuffle=True)
-        train_loader_ir = DataLoader(train_data_ir, batch_size=32, shuffle=True)
-        test_loader_rgb = DataLoader(test_data_rgb, batch_size=32, shuffle=False)
-        test_loader_ir = DataLoader(test_data_ir, batch_size=32, shuffle=False)
+        train_loader_ir  = DataLoader(train_data_ir,  batch_size=32, shuffle=True)
+        test_loader_rgb  = DataLoader(test_data_rgb,  batch_size=32, shuffle=False)
+        test_loader_ir   = DataLoader(test_data_ir,   batch_size=32, shuffle=False)
 
+        # ===== Build CB-Focal criteria based on label distributions =====
+        counts_rgb = np.bincount(
+            [int(d.y.item()) for d in train_data_rgb],
+            minlength=NUM_CLASSES
+        )
+        counts_ir = np.bincount(
+            [int(d.y.item()) for d in train_data_ir],
+            minlength=NUM_CLASSES
+        )
+
+        criterion_rgb = make_cb_focal_criterion(
+            class_counts=counts_rgb,
+            num_classes=NUM_CLASSES,
+            beta=CB_BETA,
+            gamma=FOCAL_GAMMA,
+            label_smoothing=LABEL_SMOOTHING,
+            eps=EPS,
+            device=device
+        )
+
+        criterion_ir = make_cb_focal_criterion(
+            class_counts=counts_ir,
+            num_classes=NUM_CLASSES,
+            beta=CB_BETA,
+            gamma=FOCAL_GAMMA,
+            label_smoothing=LABEL_SMOOTHING,
+            eps=EPS,
+            device=device
+        )
+
+        # ===============================
         # Scenario 1: Train on RGB, Test on IR
+        # ===============================
         print("\nScenario 1: Train on RGB, Test on IR")
-        model = TransformerNet(num_node_features=3, output_dim=9).to(device)
+        model = TransformerNet(num_node_features=3, output_dim=NUM_CLASSES).to(device)
         optimizer = Adam(model.parameters(), lr=0.001)
         scheduler = StepLR(optimizer, step_size=20, gamma=0.5)
-        criterion = torch.nn.CrossEntropyLoss()
 
         # Training loop
         for epoch in range(50):
-            train_loss = train(model, train_loader_rgb, optimizer, criterion, device)
-            print(f"Epoch {epoch + 1}: Train Loss = {train_loss:.4f}")
+            train_loss = train(model, train_loader_rgb, optimizer, criterion_rgb, device)
+            print(f"[Fold {fold+1}][RGB->IR] Epoch {epoch + 1}: Train Loss = {train_loss:.4f}")
             scheduler.step()
 
         # Evaluation
         evaluate_and_print_results(model, test_loader_ir, device, "Train on RGB, Test on IR")
 
+        # ===============================
         # Scenario 2: Train on IR, Test on RGB
+        # ===============================
         print("\nScenario 2: Train on IR, Test on RGB")
-        model = TransformerNet(num_node_features=3, output_dim=9).to(device)
+        model = TransformerNet(num_node_features=3, output_dim=NUM_CLASSES).to(device)
         optimizer = Adam(model.parameters(), lr=0.001)
         scheduler = StepLR(optimizer, step_size=20, gamma=0.5)
 
         # Training loop
         for epoch in range(50):
-            train_loss = train(model, train_loader_ir, optimizer, criterion, device)
-            print(f"Epoch {epoch + 1}: Train Loss = {train_loss:.4f}")
+            train_loss = train(model, train_loader_ir, optimizer, criterion_ir, device)
+            print(f"[Fold {fold+1}][IR->RGB] Epoch {epoch + 1}: Train Loss = {train_loss:.4f}")
             scheduler.step()
 
         # Evaluation
