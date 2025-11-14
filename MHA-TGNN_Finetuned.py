@@ -1,4 +1,3 @@
-
 import os
 import time
 import torch
@@ -11,6 +10,66 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
+
+# ==============================
+# CB-Focal (imbalance) settings
+# ==============================
+CB_BETA         = 0.995     # 0.99–0.999 usually
+FOCAL_GAMMA     = 1.5       # 1.0–2.0
+LABEL_SMOOTHING = 0.05      # 0–0.1 typically
+NUM_CLASSES     = 9
+EPS             = 1e-8
+
+def make_cb_focal_criterion(class_counts,
+                            num_classes,
+                            beta=0.995,
+                            gamma=1.5,
+                            label_smoothing=0.05,
+                            eps=1e-8,
+                            device=None):
+    """
+    Class-Balanced Focal Loss with label smoothing.
+
+    - class_counts: array-like of length C with sample counts per class
+    """
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    # Class-Balanced weights (Effective Number of Samples)
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # normalize weights to mean 1.0 (keeps loss scale stable)
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B]
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)  # [B, C]
+
+        # label smoothing: y = (1-ε)*one_hot + ε/C
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        # p_t = sum_c y_true_c * p_c
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)     # [B]
+        focal = (1.0 - p_t).pow(gamma)                      # [B]
+
+        # per-class alpha weighting
+        alpha = weights.to(logits.device)                   # [C]
+        ce_per_class = -y_true * torch.log(probs) * alpha   # [B, C]
+        ce = ce_per_class.sum(dim=1)                        # [B]
+
+        loss = (focal * ce).mean()
+        return loss
+
+    return criterion
+
 
 # TransformerNet model definition
 class TransformerNet(torch.nn.Module):
@@ -87,7 +146,7 @@ def evaluate(model, test_loader, device):
             labels.extend(data.y.cpu().numpy())
             predictions.extend(preds)
     accuracy = accuracy_score(labels, predictions)
-    cm = confusion_matrix(labels, predictions, labels=list(range(9)))
+    cm = confusion_matrix(labels, predictions, labels=list(range(NUM_CLASSES)))
     return accuracy, cm
 
 
@@ -100,19 +159,21 @@ if __name__ == "__main__":
     # Define edges
     edges = [(468, node) for node in range(478) if node != 468]  # 468 connects to all
     edges += [(473, node) for node in range(478) if node != 473]  # 473 connects to all
-    edges.extend([(471, 159), (159, 469), (469, 145), (145, 471),
-                  (476, 475), (475, 474), (474, 477), (477, 476),
-                  (1, 33), (1, 173), (1, 162), (1, 263), (1, 398), (1, 368),
-                  (33, 246), (246, 161), (161, 160), (160, 470), (470, 158), (158, 157),
-                  (157, 173), (173, 155), (155, 154), (154, 153), (153, 145), (145, 144),
-                  (144, 163), (163, 7), (7, 33),
-                  (398, 384), (384, 385), (385, 386), (386, 387), (387, 388),
-                  (388, 263), (263, 249), (249, 390), (390, 373), (373, 374),
-                  (374, 380), (380, 381), (381, 382), (382, 398)])
+    edges.extend([
+        (471, 159), (159, 469), (469, 145), (145, 471),
+        (476, 475), (475, 474), (474, 477), (477, 476),
+        (1, 33), (1, 173), (1, 162), (1, 263), (1, 398), (1, 368),
+        (33, 246), (246, 161), (161, 160), (160, 470), (470, 158), (158, 157),
+        (157, 173), (173, 155), (155, 154), (154, 153), (153, 145), (145, 144),
+        (144, 163), (163, 7), (7, 33),
+        (398, 384), (384, 385), (385, 386), (386, 387), (387, 388),
+        (388, 263), (263, 249), (249, 390), (390, 373), (373, 374),
+        (374, 380), (380, 381), (381, 382), (382, 398)
+    ])
 
     # Start validation from Subject 6 onward (test on 6, then 7, ..., 15)
-    total_cm = np.zeros((9, 9), dtype=int)
-    total_accuracy = 0
+    total_cm = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=int)
+    total_accuracy = 0.0
     num_folds = 10  # Subjects 6 to 15
 
     for test_subject in range(6, 16):  # Test on subjects 6 to 15
@@ -133,7 +194,7 @@ if __name__ == "__main__":
         test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
 
         # Load pretrained model and fine-tune
-        model = TransformerNet(num_node_features=3, output_dim=9).to(device)
+        model = TransformerNet(num_node_features=3, output_dim=NUM_CLASSES).to(device)
         pretrained_weights = torch.load(model_path, map_location=device)
         pretrained_weights.pop("fc.weight", None)
         pretrained_weights.pop("fc.bias", None)
@@ -142,12 +203,28 @@ if __name__ == "__main__":
         torch.nn.init.zeros_(model.fc.bias)
 
         optimizer = Adam(model.parameters(), lr=0.001)
-        criterion = torch.nn.CrossEntropyLoss()
+
+        # ===== Build CB-Focal criterion based on train_data label distribution =====
+        counts = np.bincount(
+            [int(d.y.item()) for d in train_data],
+            minlength=NUM_CLASSES
+        )
+        criterion = make_cb_focal_criterion(
+            class_counts=counts,
+            num_classes=NUM_CLASSES,
+            beta=CB_BETA,
+            gamma=FOCAL_GAMMA,
+            label_smoothing=LABEL_SMOOTHING,
+            eps=EPS,
+            device=device
+        )
 
         # Training
         start_train_time = time.time()
         for epoch in range(50):
             train_loss = train(model, train_loader, optimizer, criterion, device)
+            # you can print train_loss if you want:
+            # print(f"Epoch {epoch+1:03d} | loss={train_loss:.4f}")
         train_time = time.time() - start_train_time
 
         # Testing
@@ -166,6 +243,6 @@ if __name__ == "__main__":
     # Average results
     avg_accuracy = total_accuracy / num_folds
     print(f"\nAverage Accuracy Across All Folds: {avg_accuracy:.4f}")
-    ConfusionMatrixDisplay(confusion_matrix=total_cm, display_labels=list(range(9))).plot(cmap="viridis")
+    ConfusionMatrixDisplay(confusion_matrix=total_cm, display_labels=list(range(NUM_CLASSES))).plot(cmap="viridis")
     plt.title("Average Confusion Matrix")
     plt.show()
