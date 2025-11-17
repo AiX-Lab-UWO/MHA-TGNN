@@ -16,22 +16,76 @@ from sklearn.model_selection import KFold
 # ==============================
 # Config
 # ==============================
-DATA_DIR = r"...\DMD"   # RGB only
+DATA_DIR     = r"...\DMD"   # RGB only
 NUM_SUBJECTS = 15
-NUM_CLASSES = 9
-EPOCHS = 50
-BATCH_SIZE = 32
-LR = 1e-3
-STEP_SIZE = 20
-GAMMA = 0.5
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_CLASSES  = 9
+EPOCHS       = 50
+BATCH_SIZE   = 32
+LR           = 1e-3
+STEP_SIZE    = 20
+GAMMA        = 0.5
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ==============================
-# ==== config ====
-HEADS = 8  # <-- ablation: number of attention heads
+# ==== Attention heads config ====
+HEADS = 8  # ablation: number of attention heads
+
+CB_BETA         = 0.995     # 0.99–0.999 usually
+FOCAL_GAMMA     = 1.5       # 1.0–2.0
+LABEL_SMOOTHING = 0.05      # 0–0.1 typically
+EPS             = 1e-8
+
+def make_cb_focal_criterion(class_counts,
+                            num_classes,
+                            beta=0.995,
+                            gamma=1.5,
+                            label_smoothing=0.05,
+                            eps=1e-8,
+                            device=None):
+    """
+    Class-Balanced Focal Loss with label smoothing.
+
+    - class_counts: array-like of length C with sample counts per class
+    """
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    # Class-Balanced weights (Effective Number of Samples)
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # normalize weights to mean 1.0 (keeps loss scale stable)
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B]
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)  # [B, C]
+
+        # label smoothing: y = (1-ε)*one_hot + ε/C
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        # p_t = sum_c y_true_c * p_c
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)     # [B]
+        focal = (1.0 - p_t).pow(gamma)                      # [B]
+
+        # per-class alpha weighting
+        alpha = weights.to(logits.device)                   # [C]
+        ce_per_class = -y_true * torch.log(probs) * alpha   # [B, C]
+        ce = ce_per_class.sum(dim=1)                        # [B]
+
+        loss = (focal * ce).mean()
+        return loss
+
+    return criterion
 
 # ----------------------------
-# TransformerNet (heads = 2)
+# TransformerNet
 # ----------------------------
 class TransformerNet(nn.Module):
     """
@@ -48,9 +102,12 @@ class TransformerNet(nn.Module):
         head_dim2 = 32   # 32 * 8 = 256
 
         # concat=False => output width == out_channels (not heads * out_channels)
-        self.conv1 = TransformerConv(num_node_features, head_dim1 * heads, heads=heads, concat=False)  # 3 -> 512
-        self.conv2 = TransformerConv(head_dim1 * heads, head_dim2 * heads, heads=heads, concat=False) # 512 -> 256
-        self.conv3 = TransformerConv(head_dim2 * heads, tail_dim,            heads=heads, concat=False) # 256 -> 128
+        self.conv1 = TransformerConv(num_node_features, head_dim1 * heads,
+                                     heads=heads, concat=False)  # 3 -> 512
+        self.conv2 = TransformerConv(head_dim1 * heads, head_dim2 * heads,
+                                     heads=heads, concat=False)  # 512 -> 256
+        self.conv3 = TransformerConv(head_dim2 * heads, tail_dim,
+                                     heads=heads, concat=False)  # 256 -> 128
 
         self.att_pool = GlobalAttention(gate_nn=nn.Linear(tail_dim, 1))  # gate over 128-D nodes
         self.fc       = nn.Linear(tail_dim, output_dim)                  # 128 -> 9 classes
@@ -60,7 +117,7 @@ class TransformerNet(nn.Module):
         x, edge_index, batch = data.x, data.edge_index, data.batch
         x = self.act(self.conv1(x, edge_index))  # [N, 512]
         x = self.act(self.conv2(x, edge_index))  # [N, 256]
-        x = self.act(self.conv3(x, edge_index))  # [N, 128]  <-- wider tail
+        x = self.act(self.conv3(x, edge_index))  # [N, 128]
         g = self.att_pool(x, batch)              # [B, 128]
         return self.fc(g)
 
@@ -185,26 +242,32 @@ def evaluate(model, loader, device):
     return acc, cm
 
 # ==============================
-# Main (RGB only, heads=16)
+# Main (RGB only)
 # ==============================
 if __name__ == "__main__":
     device = DEVICE
 
-    # Graph edges (your 998-ish defined edges)
+    # Graph edges (your defined edges)
     edges = [(468, node) for node in range(478) if node != 468]
     edges += [(473, node) for node in range(478) if node != 473]
-    edges.extend([(471, 159), (159, 469), (469, 145), (145, 471), (476, 475), (475, 474), (474, 477), (477, 476),
-                  (1, 33), (1, 173), (1, 162), (1, 263), (1, 398), (1, 368), (33, 246), (146, 161), (161, 160),
-                  (160, 150), (150, 158), (158, 157), (157, 173), (173, 155), (155, 154), (154, 153), (153, 145),
-                  (145, 144), (144, 163), (163, 7), (7, 33), (398, 384), (384, 385), (385, 386), (386, 387), (387, 388),
-                  (388, 263), (263, 249), (249, 390), (390, 373), (373, 374), (374, 380), (380, 381), (381, 382),
-                  (382, 398)])
+    edges.extend([
+        (471, 159), (159, 469), (469, 145), (145, 471),
+        (476, 475), (475, 474), (474, 477), (477, 476),
+        (1, 33), (1, 173), (1, 162), (1, 263), (1, 398), (1, 368),
+        (33, 246), (146, 161), (161, 160),
+        (160, 150), (150, 158), (158, 157), (157, 173),
+        (173, 155), (155, 154), (154, 153), (153, 145),
+        (145, 144), (144, 163), (163, 7), (7, 33),
+        (398, 384), (384, 385), (385, 386), (386, 387), (387, 388),
+        (388, 263), (263, 249), (249, 390), (390, 373), (373, 374),
+        (374, 380), (380, 381), (381, 382), (382, 398)
+    ])
 
     subjects = list(range(1, NUM_SUBJECTS + 1))
     kf = KFold(n_splits=NUM_SUBJECTS, shuffle=False)
 
     for fold, (train_idx, test_idx) in enumerate(kf.split(subjects), start=1):
-        print(f"\n===== Fold {fold}/{NUM_SUBJECTS} (last layer=128, RGB-only) =====")
+        print(f"\n===== Fold {fold}/{NUM_SUBJECTS} (last layer=128, RGB-only, CB-Focal) =====")
 
         # --- Build datasets (RGB only)
         train_graphs, test_graphs = [], []
@@ -218,45 +281,69 @@ if __name__ == "__main__":
         train_loader = DataLoader(train_graphs, batch_size=BATCH_SIZE, shuffle=True)
         test_loader  = DataLoader(test_graphs,  batch_size=BATCH_SIZE, shuffle=False)
 
+        # --- Build CB-Focal criterion from training-set class distribution
+        counts = np.bincount(
+            [int(d.y.item()) for d in train_graphs],
+            minlength=NUM_CLASSES
+        )
+        crit = make_cb_focal_criterion(
+            class_counts=counts,
+            num_classes=NUM_CLASSES,
+            beta=CB_BETA,
+            gamma=FOCAL_GAMMA,
+            label_smoothing=LABEL_SMOOTHING,
+            eps=EPS,
+            device=device
+        )
+
         # --- Model / Opt / Sched
-        model = TransformerNet(num_node_features=3, output_dim=9, heads=8).to(device)
+        model = TransformerNet(num_node_features=3, output_dim=NUM_CLASSES, heads=HEADS).to(device)
         optim = torch.optim.Adam(model.parameters(), lr=LR)
         sched = torch.optim.lr_scheduler.StepLR(optim, step_size=STEP_SIZE, gamma=GAMMA)
-        crit  = nn.CrossEntropyLoss()
 
         # --- Static metrics (params, FLOPs)
         params_m = count_params_m(model)
-        # widths are 512 -> 256 -> 64 as defined by your head_dim scheme
-        widths = [512, 256, 128]
-        # take graph sizes from any sample (all have same topology)
-        sample = train_graphs[0]
-        n_nodes = sample.x.size(0)
-        n_edges = sample.edge_index.size(1)
-        gflops = estimate_gflops_per_sample(n_nodes, n_edges, in_ch=3, widths=widths, heads=16, num_classes=NUM_CLASSES)
+        widths   = [512, 256, 128]
+        sample   = train_graphs[0]
+        n_nodes  = sample.x.size(0)
+        n_edges  = sample.edge_index.size(1)
+        gflops   = estimate_gflops_per_sample(
+            n_nodes, n_edges, in_ch=3,
+            widths=widths, heads=HEADS,
+            num_classes=NUM_CLASSES
+        )
 
         # --- Train (time it)
-        t0 = time.time()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_train_start = time.perf_counter()
+
         for ep in range(1, EPOCHS + 1):
-            # per-epoch timing (CUDA-safe)
             if device.type == "cuda":
                 torch.cuda.synchronize()
-            t0 = time.perf_counter()
+            t_ep_start = time.perf_counter()
 
             loss = train_one_epoch(model, train_loader, optim, crit, device)
             sched.step()
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            dt = t1 - t0
+            t_ep_end = time.perf_counter()
+            dt = t_ep_end - t_ep_start
 
             curr_lr = optim.param_groups[0]["lr"]
             print(f"[Fold {fold}] epoch {ep:03d}/{EPOCHS}  loss={loss:.4f}  time={dt:.1f}s  lr={curr_lr:.2e}",
                   flush=True)
-        train_time_s = time.time() - t0
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        train_time_s = time.perf_counter() - t_train_start
 
         # --- Inference time
-        infer_ms = measure_infer_ms_per_sample(model, test_loader, device, warmup_batches=5, max_batches=20)
+        infer_ms = measure_infer_ms_per_sample(
+            model, test_loader, device,
+            warmup_batches=5, max_batches=20
+        )
 
         # --- Evaluate (once per fold)
         acc, cm = evaluate(model, test_loader, device)
