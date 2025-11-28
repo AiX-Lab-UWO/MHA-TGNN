@@ -19,18 +19,62 @@ DATA_DIR = r"F:\DMD\S6_face_RGB"
 NUM_SUBJECTS = 15
 NUM_CLASSES  = 9
 EPOCHS       = 50
-BATCH_SIZE   = 2            # complete graph is heavy; try 1 first, then increase if you have memory
+BATCH_SIZE   = 2            # complete graph is heavy; start small
 LR           = 1e-3
 STEP_SIZE    = 20
 GAMMA        = 0.5
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-HEADS        = 8            # keep H=8 as baseline
+HEADS        = 8
 LAYERS       = 3
-USE_AMP      = True         # mixed precision helps a lot with memory on GPU
+USE_AMP      = True
 
 # Complete-graph options
-DIRECTED_DUPLICATE = False  # if True, adds (j,i) for every (i,j) → doubles edges & memory
+DIRECTED_DUPLICATE = False  # if True: add (j,i) for each (i,j) → doubles E & memory
+
+CB_BETA         = 0.995   # set to None for plain focal
+FOCAL_GAMMA     = 1.5
+LABEL_SMOOTHING = 0.05
+EPS             = 1e-8
+
+# ==============================
+# Loss: Class-Balanced Focal (with optional label smoothing)
+# ==============================
+def make_cb_focal_criterion(class_counts, num_classes=NUM_CLASSES, beta=CB_BETA,
+                            gamma=FOCAL_GAMMA, label_smoothing=LABEL_SMOOTHING,
+                            eps=EPS, device=None):
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # normalize to mean 1.0 (stable scale)
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B]
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)
+
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)   # [B]
+        focal = (1.0 - p_t).pow(gamma)                     # [B]
+
+        alpha = weights.to(logits.device)                  # [C]
+        ce_per_class = -y_true * torch.log(probs) * alpha  # [B, C]
+        ce = ce_per_class.sum(dim=1)                       # [B]
+
+        return (focal * ce).mean()
+
+    return criterion
 
 # ==============================
 # Model (same as your baseline; no edge attrs here)
@@ -70,11 +114,19 @@ def complete_graph_edge_index(n_nodes: int, directed_duplicate: bool = False) ->
 # ==============================
 # Build RGB graphs using the complete edge_index
 # ==============================
+def _to_zero_based(z):
+    """Accept 0..8 or 1..9 → return 0..8; else raise."""
+    z = int(z)
+    if 0 <= z <= 8: return z
+    if 1 <= z <= 9: return z - 1
+    raise ValueError(f"Unexpected label (not in 0..8 or 1..9): {z}")
+
 def build_graphs_complete(df_landmarks, edge_index):
     data_list = []
     for _, row in df_landmarks.iterrows():
         coords = row.iloc[3:].to_numpy(dtype=np.float32).reshape(-1, 3)  # [478,3]
-        gaze   = int(row["Gaze Zone Number"])
+        gaze_raw = int(row["Gaze Zone Number"])
+        gaze     = _to_zero_based(gaze_raw)  # normalize to 0..8
         x  = torch.from_numpy(coords)
         y  = torch.tensor([gaze], dtype=torch.long)
         data = Data(x=x, edge_index=edge_index, y=y)
@@ -168,7 +220,7 @@ def train_one_epoch(model, loader, optim, crit, device, scaler: GradScaler, amp:
         else:
             loss.backward()
             optim.step()
-        total += loss.item()
+        total += float(loss.item())
     return total / max(1, len(loader))
 
 @torch.no_grad()
@@ -222,15 +274,27 @@ if __name__ == "__main__":
         model = TransformerNet(num_node_features=3, output_dim=NUM_CLASSES).to(device)
         optim = torch.optim.Adam(model.parameters(), lr=LR)
         sched = torch.optim.lr_scheduler.StepLR(optim, step_size=STEP_SIZE, gamma=GAMMA)
-        crit  = nn.CrossEntropyLoss()
+
+        # ======= Build CB-Focal criterion using TRAIN fold label counts =======
+        counts = np.bincount([int(d.y.item()) for d in train_graphs], minlength=NUM_CLASSES)
+        print("Train class counts:", counts.tolist())
+        crit  = make_cb_focal_criterion(
+            class_counts=counts,
+            num_classes=NUM_CLASSES,
+            beta=CB_BETA,
+            gamma=FOCAL_GAMMA,
+            label_smoothing=LABEL_SMOOTHING,
+            device=device
+        )
+
         scaler = GradScaler(enabled=(USE_AMP and device.type == "cuda"))
 
         # --- Static metrics (params, GFLOPs) from one sample
         params_m = count_params_m(model)
         widths   = [512, 256, 64]  # 3 layers, concat=False
         sample   = train_graphs[0]
-        n_nodes  = sample.x.size(0)                               # should be 478
-        n_edges  = sample.edge_index.size(1)                      # ~114,  478*477/2 if no duplicates
+        n_nodes  = sample.x.size(0)                               # 478
+        n_edges  = sample.edge_index.size(1)                      # ≈ 478*477/2 if no duplicates
         gflops   = estimate_gflops_per_sample(n_nodes, n_edges, in_ch=3,
                                               widths=widths, heads=HEADS,
                                               num_classes=NUM_CLASSES)
