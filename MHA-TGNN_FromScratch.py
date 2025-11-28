@@ -15,9 +15,9 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 
-CB_BETA         = 0.995     # 0.99–0.999 usually
-FOCAL_GAMMA     = 1.5       # 1.0–2.0
-LABEL_SMOOTHING = 0.05      # 0–0.1 typically
+CB_BETA         = 0.995     
+FOCAL_GAMMA     = 1.5       
+LABEL_SMOOTHING = 0.05      
 NUM_CLASSES     = 9
 EPS             = 1e-8
 
