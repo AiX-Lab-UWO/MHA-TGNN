@@ -29,6 +29,12 @@ PIN_MEMORY     = True
 PRINT_EVERY    = 50
 SEED           = 1337
 
+# ---- CB-Focal hyperparams ----
+CB_BETA          = 0.995      # 0.99–0.999 usually
+FOCAL_GAMMA      = 1.5        # 1.0–2.0
+LABEL_SMOOTHING  = 0.05       # 0 to disable
+EPS              = 1e-8
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.backends.cudnn.benchmark = True
 
@@ -148,6 +154,49 @@ def evaluate(model, loader, device, use_amp=True):
     macro_f1  = f1_score(y_true, y_pred, average='macro')
     return micro_acc, macro_acc, macro_f1
 
+# ===================== LOSS: CB-Focal ======================
+def make_cb_focal_criterion(class_counts, num_classes, beta=CB_BETA, gamma=FOCAL_GAMMA,
+                            label_smoothing=LABEL_SMOOTHING, eps=EPS, device=None):
+    """
+    Class-Balanced Focal Loss with optional label smoothing.
+    - class_counts: iterable length C (per-class sample counts from training set)
+    """
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    # Class-Balanced weights via "Effective Number of Samples"
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # Normalize to mean 1 (keeps loss scale stable)
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B] (long)
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)  # [B, C]
+
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        # p_t = sum_c y_true_c * p_c
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)     # [B]
+        focal = (1.0 - p_t).pow(gamma)                       # [B]
+
+        alpha = weights.to(logits.device)                    # [C]
+        ce_per_class = -y_true * torch.log(probs) * alpha    # [B, C]
+        ce = ce_per_class.sum(dim=1)                         # [B]
+
+        loss = (focal * ce).mean()
+        return loss
+
+    return criterion
+
 # ===================== DATA ======================
 def make_loaders(train_dir, val_dir, model_name, batch_size, num_workers):
     # Create a headless model to fetch transforms consistent with pretraining
@@ -172,14 +221,20 @@ def make_loaders(train_dir, val_dir, model_name, batch_size, num_workers):
     )
 
     input_h, input_w = cfg['input_size'][1], cfg['input_size'][2]  # (3,H,W)
-    return train_loader, val_loader, num_classes, (input_h, input_w)
+
+    # ---- Compute class counts from training set for CB-Focal ----
+    import numpy as np
+    targets = np.array(train_ds.targets)  # list of ints
+    class_counts = np.bincount(targets, minlength=num_classes)
+
+    return train_loader, val_loader, num_classes, (input_h, input_w), class_counts
 
 # ===================== TRAIN =====================
 def train():
     set_seed(SEED)
     print(f"Device: {DEVICE} | AMP: {AMP and DEVICE.type=='cuda'}")
 
-    train_loader, val_loader, num_classes, in_hw = make_loaders(
+    (train_loader, val_loader, num_classes, in_hw, class_counts) = make_loaders(
         TRAIN_DIR, VAL_DIR, MODEL_NAME, BATCH_SIZE, NUM_WORKERS
     )
 
@@ -191,6 +246,16 @@ def train():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     scaler = torch.cuda.amp.GradScaler(enabled=(AMP and DEVICE.type == 'cuda'))
+
+    # ---- Build CB-Focal criterion using train set class_counts ----
+    criterion = make_cb_focal_criterion(
+        class_counts=class_counts,
+        num_classes=num_classes,
+        beta=CB_BETA,
+        gamma=FOCAL_GAMMA,
+        label_smoothing=LABEL_SMOOTHING,
+        device=DEVICE
+    )
 
     # Stats (params + GFLOPs w/o moving the live model)
     total_params, trainable_params = count_params(model)
@@ -220,7 +285,7 @@ def train():
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(AMP and DEVICE.type == 'cuda')):
                 logits = model(images)
-                loss = F.cross_entropy(logits, targets)
+                loss = criterion(logits, targets)  # <-- CB-Focal here
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
