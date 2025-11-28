@@ -29,7 +29,7 @@ PIN_MEMORY     = True
 PRINT_EVERY    = 50
 SEED           = 1337
 
-# ---- CB-Focal hyperparams ----
+
 CB_BETA          = 0.995      # 0.99–0.999 usually
 FOCAL_GAMMA      = 1.5        # 1.0–2.0
 LABEL_SMOOTHING  = 0.05       # 0 to disable
