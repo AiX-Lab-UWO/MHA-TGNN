@@ -29,6 +29,49 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---- Ablation: L = 2, H = 8 ----
 HEADS = 8   # keep 8 heads
 
+
+CB_BETA         = 0.995   # set to None for plain focal
+FOCAL_GAMMA     = 1.5
+LABEL_SMOOTHING = 0.05
+EPS             = 1e-8
+
+
+def make_cb_focal_criterion(class_counts, num_classes=NUM_CLASSES, beta=CB_BETA,
+                            gamma=FOCAL_GAMMA, label_smoothing=LABEL_SMOOTHING,
+                            eps=EPS, device=None):
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # normalize to mean 1.0
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B]
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)
+
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)   # [B]
+        focal = (1.0 - p_t).pow(gamma)                     # [B]
+
+        alpha = weights.to(logits.device)                  # [C]
+        ce_per_class = -y_true * torch.log(probs) * alpha  # [B, C]
+        ce = ce_per_class.sum(dim=1)                       # [B]
+
+        return (focal * ce).mean()
+
+    return criterion
+
 # ==============================
 # Model: 2-layer Graph Transformer (L=2)
 # ==============================
@@ -54,18 +97,29 @@ class TransformerNet(nn.Module):
 # ==============================
 # Data utils
 # ==============================
+def _to_zero_based(z):
+    """Accept 0..8 or 1..9 -> return 0..8; else raise."""
+    z = int(z)
+    if 0 <= z <= 8: return z
+    if 1 <= z <= 9: return z - 1
+    raise ValueError(f"Unexpected label (not in 0..8 or 1..9): {z}")
+
 def build_graphs(df_landmarks, edges):
     data_list = []
     for _, row in df_landmarks.iterrows():
         landmarks = row.iloc[3:].values.reshape(-1, 3).astype(np.float32)
-        gaze_zone = int(row["Gaze Zone Number"])
+        gaze_zone_raw = int(row["Gaze Zone Number"])
+        gaze_zone = _to_zero_based(gaze_zone_raw)  # normalize to 0..8
+
         G = nx.Graph()
         for i, landmark in enumerate(landmarks):
             G.add_node(i, pos=landmark)
         G.add_edges_from(edges)
+
         x = torch.tensor([G.nodes[i]['pos'] for i in G.nodes()], dtype=torch.float32)
         edge_index = torch.tensor(list(G.edges)).t().contiguous().long()
         y = torch.tensor([gaze_zone], dtype=torch.long)
+
         data = Data(x=x, edge_index=edge_index, y=y)
         data_list.append(data)
     return data_list
@@ -144,12 +198,12 @@ def train_one_epoch(model, loader, optim, crit, device):
     total = 0.0
     for data in loader:
         data = data.to(device)
-        optim.zero_grad()
+        optim.zero_grad(set_to_none=True)
         out = model(data)
         loss = crit(out, data.y)
         loss.backward()
         optim.step()
-        total += loss.item()
+        total += float(loss.item())
     return total / max(1, len(loader))
 
 @torch.no_grad()
@@ -208,7 +262,18 @@ if __name__ == "__main__":
         model = TransformerNet(num_node_features=3, output_dim=NUM_CLASSES).to(device)
         optim = torch.optim.Adam(model.parameters(), lr=LR)
         sched = torch.optim.lr_scheduler.StepLR(optim, step_size=STEP_SIZE, gamma=GAMMA)
-        crit  = nn.CrossEntropyLoss()
+
+        # ====== Build CB-Focal criterion using TRAIN fold counts ======
+        counts = np.bincount([int(d.y.item()) for d in train_graphs], minlength=NUM_CLASSES)
+        print("Train class counts:", counts.tolist())
+        crit  = make_cb_focal_criterion(
+            class_counts=counts,
+            num_classes=NUM_CLASSES,
+            beta=CB_BETA,
+            gamma=FOCAL_GAMMA,
+            label_smoothing=LABEL_SMOOTHING,
+            device=device
+        )
 
         # --- Static metrics (params, GFLOPs)
         params_m = count_params_m(model)
