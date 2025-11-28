@@ -19,8 +19,8 @@ DATA_DIR = r"...\DMD"
 NUM_SUBJECTS = 15
 NUM_CLASSES  = 9
 EPOCHS       = 50
-BATCH_SIZE   = 4       
-LR           = 1e-3     
+BATCH_SIZE   = 4
+LR           = 1e-3
 WEIGHT_DECAY = 1e-4
 STEP_SIZE    = 20
 GAMMA        = 0.5
@@ -32,9 +32,52 @@ USE_EDGE_ATTR     = True
 EDGE_ATTR_DIM     = 4       # (ux, uy, uz, log1p(dist))
 HEADS             = 8
 LAYERS            = 3
-USE_AMP           = False    # IMPORTANT: keep off for this ablation
+USE_AMP           = False    # keep off for this ablation
 
 EPS = 1e-6
+
+CB_BETA         = 0.995     # set to None for plain focal (no class balancing)
+FOCAL_GAMMA     = 1.5
+LABEL_SMOOTHING = 0.05
+
+# ==============================
+# Class-Balanced Focal Loss (+ optional label smoothing)
+# ==============================
+def make_cb_focal_criterion(class_counts, num_classes=NUM_CLASSES, beta=CB_BETA,
+                            gamma=FOCAL_GAMMA, label_smoothing=LABEL_SMOOTHING,
+                            eps=1e-8, device=None):
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if device is not None:
+        counts = counts.to(device)
+
+    if beta is not None:
+        effective_num = 1.0 - torch.pow(torch.as_tensor(beta, device=counts.device), counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    else:
+        weights = torch.ones_like(counts)
+
+    # normalize to mean 1.0 for stable scaling
+    weights = weights * (num_classes / (weights.sum() + eps))
+
+    def criterion(logits, targets):
+        # logits: [B, C], targets: [B]
+        probs = torch.softmax(logits, dim=1).clamp_min(eps)
+
+        with torch.no_grad():
+            y_true = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+            if label_smoothing and label_smoothing > 0:
+                y_true = (1.0 - label_smoothing) * y_true + (label_smoothing / num_classes)
+
+        p_t = (probs * y_true).sum(dim=1).clamp_min(eps)   # [B]
+        focal = (1.0 - p_t).pow(gamma)                     # [B]
+
+        alpha = weights.to(logits.device)                  # [C]
+        ce_per_class = -y_true * torch.log(probs) * alpha  # [B, C]
+        ce = ce_per_class.sum(dim=1)                       # [B]
+
+        return (focal * ce).mean()
+
+    return criterion
 
 # ==============================
 # Model (TransformerConv with edge_attr + LayerNorm + dropout)
@@ -114,15 +157,22 @@ def knn_graph_with_attrs(coords_np, k=8, symmetric=False):
 # ==============================
 # Data utils (RGB only)
 # ==============================
-from torch_geometric.data import Data
+def _to_zero_based(z):
+    """Accept 0..8 or 1..9 -> return 0..8; else raise."""
+    z = int(z)
+    if 0 <= z <= 8: return z
+    if 1 <= z <= 9: return z - 1
+    raise ValueError(f"Unexpected label (not in 0..8 or 1..9): {z}")
 
 def build_graphs_knn(df_landmarks, k=K_NEIGHBORS):
     data_list = []
     for _, row in df_landmarks.iterrows():
         coords = row.iloc[3:].to_numpy(dtype=np.float32).reshape(-1, 3)  # [478,3]
-        gaze   = int(row["Gaze Zone Number"])
+        gaze_raw = int(row["Gaze Zone Number"])
+        gaze     = _to_zero_based(gaze_raw)  # normalize to 0..8
+
         ei, ea = knn_graph_with_attrs(coords, k=k, symmetric=SYMMETRIC_EDGES)
-        x = torch.from_numpy(normalize_coords(coords))  # use normalized node features too
+        x = torch.from_numpy(normalize_coords(coords))  # normalized node features
         y = torch.tensor([gaze], dtype=torch.long)
         data = Data(x=x, edge_index=ei.long(), edge_attr=ea, y=y)
         data_list.append(data)
@@ -200,7 +250,6 @@ def train_one_epoch(model, loader, optim, crit, device, clip_grad=1.0):
         out = model(data)
         loss = crit(out, data.y)
 
-        # NaN guard (early)
         if not torch.isfinite(loss):
             print(">> WARNING: non-finite loss detected; skipping batch")
             continue
@@ -258,7 +307,18 @@ if __name__ == "__main__":
         model = TransformerNet(num_node_features=3, output_dim=NUM_CLASSES).to(device)
         optim = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
         sched = torch.optim.lr_scheduler.StepLR(optim, step_size=STEP_SIZE, gamma=GAMMA)
-        crit  = nn.CrossEntropyLoss()
+
+        # ====== Build CB-Focal criterion using TRAIN-fold class counts ======
+        counts = np.bincount([int(d.y.item()) for d in train_graphs], minlength=NUM_CLASSES)
+        print("Train class counts:", counts.tolist())
+        crit  = make_cb_focal_criterion(
+            class_counts=counts,
+            num_classes=NUM_CLASSES,
+            beta=CB_BETA,
+            gamma=FOCAL_GAMMA,
+            label_smoothing=LABEL_SMOOTHING,
+            device=device
+        )
 
         # --- Static metrics (params, GFLOPs) from a kNN sample
         params_m = count_params_m(model)
